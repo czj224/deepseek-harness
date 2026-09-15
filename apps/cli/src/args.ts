@@ -44,8 +44,15 @@ interface PluginInvocation {
   args: string[]
 }
 
+/** Supervise a nested `dsh` invocation: relaunch it after a crash. */
+interface WatchInvocation {
+  mode: 'watch'
+  /** The nested `dsh` arguments to supervise, verbatim. */
+  args: string[]
+}
+
 /** The resolved `dsh` invocation. Help, version, and errors exit inside {@link parseDshArgs}. */
-export type DshInvocation = ProfileInvocation | DumpConfigInvocation | PluginInvocation
+export type DshInvocation = ProfileInvocation | DumpConfigInvocation | PluginInvocation | WatchInvocation
 
 /** Launcher flags shared by the default command and the `web` alias. */
 interface BootOptions {
@@ -178,6 +185,18 @@ export function parseDshArgs(argv: readonly string[], version: string): DshInvoc
       if (options.profile === '') program.error('error: --profile needs a name')
       if (args.length === 0) program.error('error: plugin needs pnpm arguments to forward (e.g. add <package>)')
       resolved = { mode: 'plugin', profile: options.profile, args }
+    })
+
+  const watch = program.command('watch').description('supervise a nested dsh invocation, relaunching it after a crash')
+  watch
+    .allowUnknownOption()
+    .passThroughOptions()
+    .enablePositionalOptions()
+    .argument('[args...]', 'the nested dsh invocation to supervise (e.g. web, or --profile headless "task")')
+    .action((args: string[]) => {
+      rejectParentOptions('watch')
+      if (args.length === 0) program.error('error: watch needs a nested dsh invocation (e.g. dsh watch web)')
+      resolved = { mode: 'watch', args }
     })
 
   try {

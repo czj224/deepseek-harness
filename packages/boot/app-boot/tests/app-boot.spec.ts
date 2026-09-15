@@ -6,9 +6,10 @@ import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import SystemPrompt, { renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import {
-  addHarnessSourceSection, assertEntriesActivated, assertEntriesLoaded, boot,
-  FAIL_LOUD_RELEASE_TIMEOUT_MS, HARNESS_SOURCE_SECTION,
-  installFailLoud, loadEnv, loadLayeredEnv, loadOverlayPatches, resolveConfigPath, type FailLoudProcess,
+  addBootHealthSection, addHarnessSourceSection, assertEntriesActivated, assertEntriesLoaded, boot,
+  FAIL_LOUD_RELEASE_TIMEOUT_MS, failedEntryIds, HARNESS_SOURCE_SECTION,
+  installFailLoud, loadEnv, loadLayeredEnv, loadOverlayPatches, readBootHealth, recordBootFailure,
+  resolveConfigPath, type FailLoudProcess,
 } from '../src/index.ts'
 
 const NAME = 'dsh-test-bin'
@@ -779,6 +780,159 @@ describe('boot', () => {
       `${NAME}: 1 entry did not activate`,
       './waiting.mjs: pending (waiting for service: neverProvided)',
     ].join('\n'))
+  })
+})
+
+describe('boot health guard', () => {
+  it('records a successful boot and clears any prior streak', async () => {
+    const dir = tmp()
+    const home = tmp()
+    writeFileSync(join(dir, 'noop.mjs'), 'export const name = "noop"\nexport function apply() {}\n')
+    writeFileSync(join(dir, 'cordis.yml'), '- id: noop\n  name: ./noop.mjs\n')
+    recordBootFailure(home, 'prior', ['old'])
+    const ctx = await boot(NAME, join(dir, 'cordis.yml'), undefined, undefined, undefined, { home })
+    try {
+      const ledger = readBootHealth(home)
+      expect(ledger?.consecutiveFailures).toBe(0)
+      expect(ledger?.lastAttemptAt).toBeTypeOf('string')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('records a failed boot with the implicated entry id', async () => {
+    const dir = tmp()
+    const home = tmp()
+    writeFileSync(join(dir, 'waiting.mjs'), 'export const inject = ["neverProvided"]\nexport function apply() {}\n')
+    writeFileSync(join(dir, 'cordis.yml'), '- id: waiting\n  name: ./waiting.mjs\n')
+    await expect(boot(NAME, join(dir, 'cordis.yml'), undefined, undefined, undefined, { home })).rejects.toThrow()
+    const ledger = readBootHealth(home)
+    expect(ledger?.consecutiveFailures).toBe(1)
+    expect(ledger?.failedEntryIds).toEqual(['waiting'])
+  })
+
+  it('recovers from a real crash loop by disabling the unactivatable entry', async () => {
+    const dir = tmp()
+    const home = tmp()
+    writeFileSync(join(dir, 'noop.mjs'), 'export const name = "noop"\nexport function apply() {}\n')
+    writeFileSync(join(dir, 'waiting.mjs'), 'export const inject = ["neverProvided"]\nexport function apply() {}\n')
+    writeFileSync(join(dir, 'cordis.yml'), [
+      '- id: waiting',
+      '  name: ./waiting.mjs',
+      '- id: noop',
+      '  name: ./noop.mjs',
+      '',
+    ].join('\n'))
+    await expect(boot(NAME, join(dir, 'cordis.yml'), undefined, undefined, undefined, { home })).rejects.toThrow()
+    await expect(boot(NAME, join(dir, 'cordis.yml'), undefined, undefined, undefined, { home })).rejects.toThrow()
+    const ctx = await boot(NAME, join(dir, 'cordis.yml'), undefined, undefined, undefined, { home })
+    try {
+      const entries = [...ctx.loader.entries()]
+      expect(entries.find(entry => entry.options.id === 'waiting')?.disabled).toBe(true)
+      expect(entries.some(entry => entry.options.id === 'noop' && entry.fiber !== undefined)).toBe(true)
+      expect(readBootHealth(home)?.consecutiveFailures).toBe(0)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('recovers a crash loop by disabling the failing entry and clearing the streak', async () => {
+    const dir = tmp()
+    const home = tmp()
+    writeFileSync(join(dir, 'noop.mjs'), 'export const name = "noop"\nexport function apply() {}\n')
+    writeFileSync(join(dir, 'cordis.yml'), [
+      '- id: ghost',
+      '  name: ./missing.mjs',
+      '- id: noop',
+      '  name: ./noop.mjs',
+      '',
+    ].join('\n'))
+    recordBootFailure(home, 'boom', ['ghost'])
+    recordBootFailure(home, 'boom', ['ghost'])
+    const write = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+    let ctx: Context | undefined
+    try {
+      ctx = await boot(NAME, join(dir, 'cordis.yml'), undefined, undefined, undefined, { home })
+      const entries = [...ctx.loader.entries()]
+      expect(entries.find(entry => entry.options.id === 'ghost')?.disabled).toBe(true)
+      expect(entries.some(entry => entry.options.id === 'noop' && entry.fiber !== undefined)).toBe(true)
+      expect(write.mock.calls.some(call => String(call[0]).includes('recovery mode'))).toBe(true)
+      expect(readBootHealth(home)?.consecutiveFailures).toBe(0)
+    } finally {
+      write.mockRestore()
+      await ctx?.fiber.dispose()
+    }
+  })
+
+  it('writes no ledger when the guard is not opted in', async () => {
+    const dir = tmp()
+    const home = tmp()
+    vi.stubEnv('DSH_HOME', home)
+    writeFileSync(join(dir, 'noop.mjs'), 'export const name = "noop"\nexport function apply() {}\n')
+    writeFileSync(join(dir, 'cordis.yml'), '- id: noop\n  name: ./noop.mjs\n')
+    const ctx = await boot(NAME, join(dir, 'cordis.yml'))
+    try {
+      expect(readBootHealth(home)).toBeUndefined()
+    } finally {
+      await ctx.fiber.dispose()
+      vi.unstubAllEnvs()
+    }
+  })
+
+  it('still boots when the health ledger home is unwritable', async () => {
+    const dir = tmp()
+    const home = tmp()
+    writeFileSync(join(home, 'blocker'), 'x') // a file blocks any subdirectory under it
+    const blockedHome = join(home, 'blocker', 'sub')
+    writeFileSync(join(dir, 'noop.mjs'), 'export const name = "noop"\nexport function apply() {}\n')
+    writeFileSync(join(dir, 'cordis.yml'), '- id: noop\n  name: ./noop.mjs\n')
+    const ctx = await boot(NAME, join(dir, 'cordis.yml'), undefined, undefined, undefined, { home: blockedHome })
+    try {
+      expect([...ctx.loader.entries()].some(entry => entry.options.id === 'noop' && entry.fiber !== undefined)).toBe(true)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+})
+
+describe('failedEntryIds', () => {
+  const ctxWith = (entries: Array<{ fiber?: { state: number }; disabled?: boolean; options: { id: string; name: string } }>): Context =>
+    ({ loader: { entries: () => entries } }) as unknown as Context
+
+  it('names fiber-less, failed, and pending enabled entries, skipping active and disabled ones', () => {
+    expect(failedEntryIds(ctxWith([
+      { fiber: { state: 2 }, options: { id: 'active', name: 'a' } },
+      { options: { id: 'ghost', name: 'g' } },
+      { fiber: { state: 3 }, options: { id: 'failed', name: 'f' } },
+      { fiber: { state: 0 }, options: { id: 'pending', name: 'p' } },
+      { fiber: { state: 3 }, disabled: true, options: { id: 'off', name: 'o' } },
+    ]))).toEqual(['ghost', 'failed', 'pending'])
+  })
+})
+
+describe('addBootHealthSection', () => {
+  it('surfaces the recovery summary only when recovering', async () => {
+    const ctx = new Context()
+    try {
+      await ctx.plugin(SystemPrompt, { persona: 'You are a coding agent.' })
+      expect(addBootHealthSection(ctx, { recovering: false, disableEntryIds: [], summary: '' })).toBeUndefined()
+      const dispose = addBootHealthSection(ctx, {
+        recovering: true,
+        disableEntryIds: ['ghost'],
+        summary: 'The harness failed to boot 2 times in a row. recovery mode with ghost disabled.',
+      })
+      expect(dispose).toBeTypeOf('function')
+      const systemPrompt = ctx.get('systemPrompt')!
+      const rendered = renderPrompt(await systemPrompt.assemble())
+      expect(rendered).toContain('recovery mode with ghost disabled')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('is a no-op without a system prompt service', () => {
+    const ctx = new Context()
+    expect(addBootHealthSection(ctx, { recovering: true, disableEntryIds: [], summary: 'x' })).toBeUndefined()
   })
 })
 

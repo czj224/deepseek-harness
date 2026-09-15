@@ -57,6 +57,14 @@ describe('parseDshArgs', () => {
       .toEqual({ mode: 'plugin', profile: 'tui', args: ['add', '--save-dev', 'x'] })
   })
 
+  it('routes the watch supervisor, handing the nested dsh invocation verbatim', () => {
+    expect(parse(['watch', 'web'])).toEqual({ mode: 'watch', args: ['web'] })
+    expect(parse(['watch', '--profile', 'headless', 'run', 'tests']))
+      .toEqual({ mode: 'watch', args: ['--profile', 'headless', 'run', 'tests'] })
+    expect(parse(['watch', 'web', '--host', '127.0.0.1', '--port', '8080']))
+      .toEqual({ mode: 'watch', args: ['web', '--host', '127.0.0.1', '--port', '8080'] })
+  })
+
   it('routes profile and web config dumps', () => {
     expect(parse(['--profile', 'web', '--dump-config']))
       .toEqual({ mode: 'dump-config', profile: 'web', defaultOnly: false, patches: [] })
@@ -96,6 +104,8 @@ describe('parseDshArgs', () => {
     expect(exitCode(['plugin', '--profile', 'tui'])).toBe(1) // nothing to forward
     expect(exitCode(['plugin', '--profile', ''])).toBe(1)
     expect(exitCode(['--profile', 'x', 'plugin', 'add', 'y'])).toBe(1)
+    expect(exitCode(['watch'])).toBe(1) // nothing to supervise
+    expect(exitCode(['--profile', 'x', 'watch', 'web'])).toBe(1) // parent flags before watch
   })
 
   it('keeps its own help for an invocation with no app to hand it to', () => {

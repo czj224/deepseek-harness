@@ -16,6 +16,9 @@ import Loader, { type Entry, type EntryOptions } from '@deepseek-ai/cordis-plugi
 import Include, { applyEntryPatches, entryListSchema, type PatchOptions } from '@deepseek-ai/cordis-plugin-include'
 import Group from '@deepseek-ai/cordis-plugin-group'
 import { dshHomePath, resolveDshHome } from '@deepseek-ai/dsh-home-paths'
+import {
+  decideRecovery, readBootHealth, recordBootFailure, recordBootSuccess, type BootHealthDecision,
+} from './boot-health.ts'
 import { createLaunchEnvironmentSnapshot, type LaunchEnvironmentSnapshot } from '@deepseek-ai/dsh-launch-environment'
 import type {} from '@deepseek-ai/cordis-plugin-hmr'
 // Side-effect type import: resolves `ctx.get('systemPrompt')` to the service.
@@ -48,6 +51,16 @@ export {
   type ProfileLayer,
   type ProfileManifest,
 } from './profile.ts'
+export {
+  BOOT_HEALTH_FILE_NAME,
+  CRASH_LOOP_THRESHOLD,
+  bootHealthPath,
+  decideRecovery,
+  readBootHealth,
+  recordBootFailure,
+  recordBootSuccess,
+  type BootHealthLedger,
+} from './boot-health.ts'
 
 /**
  * Resolve the config to boot. Replay swaps a `cordis.yml` basename for
@@ -725,6 +738,33 @@ export async function assertEntriesActivated(ctx: Context, binName: string): Pro
 }
 
 /**
+ * Loader entry ids implicated by a failed boot: enabled entries with no fiber
+ * or whose fiber failed or never activated. The boot health guard disables these
+ * ids on a recovery boot so a crash loop can degrade to a runnable tree. An
+ * entry that failed to import is rolled back and removed from the tree before
+ * this runs, so its id is absent here; the failure message still names it.
+ * @param ctx - the context whose loader entries to inspect.
+ * @returns local entry ids to disable, in entry order.
+ */
+export function failedEntryIds(ctx: Context): string[] {
+  const ids: string[] = []
+  for (const entry of ctx.loader.entries()) {
+    if (entry.disabled) continue
+    const fiber = entry.fiber
+    if (fiber === undefined || fiber.state === FIBER_FAILED || fiber.state === FIBER_PENDING) {
+      ids.push(entry.options.id)
+    }
+  }
+  return ids
+}
+
+/** Optional self-healing boot health guard wiring for {@link boot}. */
+export interface BootHealthGuardOptions {
+  /** Harness home holding the ledger; defaults to the ambient {@link resolveDshHome}. */
+  home?: string
+}
+
+/**
  * Boot the Loader against `absoluteConfigPath` and return only after the whole
  * tree settles. Relative entry names resolve against the config directory;
  * bare package names resolve there by default or against an explicit
@@ -748,6 +788,10 @@ export async function assertEntriesActivated(ctx: Context, binName: string): Pro
  * @param bareModuleBaseUrl - optional installed-host base for bare package
  * names; use it when the host, rather than the configuration project, owns the
  * complete plugin set.
+ * @param health - optional self-healing boot health guard wiring. Omit it to
+ * boot with no health recording or crash-loop recovery (the zero-side-effect
+ * contract tests rely on); pass it (or `{}`) to enable the guard against the
+ * ambient Harness home.
  * @returns the root context once every entry has started, or as soon as a
  * surface disposed the tree while startup was still in flight.
  * @throws a labelled error after disposing the partial context — `host
@@ -760,7 +804,17 @@ export async function boot(
   patches?: PatchOptions[],
   prepare?: (ctx: Context) => Promise<void> | void,
   bareModuleBaseUrl?: string,
+  health?: BootHealthGuardOptions,
 ): Promise<Context> {
+  // Enabled only when the caller opts in, so an omitted option keeps boot's
+  // zero-side-effect contract (no ledger read or write).
+  const healthHome = health?.home ?? resolveDshHome()
+  const recovery: BootHealthDecision = health === undefined
+    ? { recovering: false, disableEntryIds: [], summary: '' }
+    : decideRecovery(readBootHealth(healthHome))
+  if (recovery.recovering) process.stderr.write(`${binName}: ${recovery.summary}\n`)
+  const recoveryPatches: PatchOptions[] = recovery.disableEntryIds.map(id => ({ id, disabled: true }))
+  const effectivePatches = recoveryPatches.length === 0 ? patches : [...(patches ?? []), ...recoveryPatches]
   const ctx = new Context()
   // Two failure labels: `prepare` runs before any config-tree entry mounts,
   // so its failure is host setup, not the plugin tree.
@@ -771,7 +825,7 @@ export async function boot(
     await ctx.plugin(Loader)
     await prepare?.(ctx)
     stage = 'plugin tree failed to load'
-    await mountRootInclude(ctx, absoluteConfigPath, patches, bareModuleBaseUrl)
+    await mountRootInclude(ctx, absoluteConfigPath, effectivePatches, bareModuleBaseUrl)
     // A surface can finish and dispose the whole tree while startup is still
     // in flight, before the last entry settles. The Loader service goes with
     // it, and the activation audit describes a live tree — reading `ctx.loader`
@@ -782,8 +836,22 @@ export async function boot(
     await ctx.get('loader')?.await()
     if (ctx.get('loader') === undefined) return ctx
     await assertEntriesActivated(ctx, binName)
+    if (health !== undefined) {
+      if (recovery.recovering) addBootHealthSection(ctx, recovery)
+      recordBootSuccess(healthHome)
+    }
     return ctx
   } catch (cause) {
+    // Capture implicated entry ids before disposal; after the tree is gone the
+    // loader no longer reports them.
+    let failedPlugins: string[] = []
+    if (health !== undefined) {
+      try {
+        if (ctx.get('loader') !== undefined) failedPlugins = failedEntryIds(ctx)
+      } catch {
+        // A tree disposed mid-boot has no loader; record the failure without ids.
+      }
+    }
     // Root-fiber disposal contains cleanup failures per observer (Cordis
     // fiber.ts hardening) and a repeated call returns the settled single-shot
     // result, so this await cannot reject and replace `cause`.
@@ -797,6 +865,7 @@ export async function boot(
     let deepest: unknown = cause
     while (deepest instanceof Error && deepest.cause !== undefined) deepest = deepest.cause
     const stack = deepest instanceof Error && deepest !== cause ? `\n${deepest.stack ?? deepest.message}` : ''
+    if (health !== undefined) recordBootFailure(healthHome, detail, failedPlugins)
     throw new Error(`${binName}: ${stage}: ${detail}${stack}`, { cause })
   }
 }
@@ -825,5 +894,28 @@ export function addHarnessSourceSection(ctx: Context, sourceRoot: string): (() =
     name: HARNESS_SOURCE_SECTION,
     order: -99,
     text: `The DeepSeek Harness implementation checkout is at ${sourceRoot}. The checkout location and current working directory are separate values and may differ; never infer the working directory from this path. Use pwd to determine the current working directory. Use this checkout only to inspect or extend DSH itself.`,
+  })
+}
+
+/** Prompt-section name for the self-healing boot health recovery diagnostic. */
+export const BOOT_HEALTH_SECTION = 'harness:boot-health'
+
+/**
+ * Surface a boot-health recovery diagnostic to the agent as a global prompt
+ * section, so a harness that recovered from a crash loop tells the agent — at
+ * the highest priority — that its own boot was broken and what to repair. A
+ * booted tree with no `systemPrompt` service is a no-op returning `undefined`.
+ * @param ctx - the settled boot context whose global system prompt to augment.
+ * @param decision - the recovery decision from {@link decideRecovery}.
+ * @returns the section disposer, or `undefined` when no `systemPrompt` service is mounted.
+ */
+export function addBootHealthSection(ctx: Context, decision: BootHealthDecision): (() => void) | undefined {
+  if (!decision.recovering) return undefined
+  const systemPrompt = ctx.get('systemPrompt')
+  if (systemPrompt === undefined) return undefined
+  return systemPrompt.section({
+    name: BOOT_HEALTH_SECTION,
+    order: -98,
+    text: decision.summary,
   })
 }

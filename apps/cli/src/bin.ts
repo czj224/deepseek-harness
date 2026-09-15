@@ -47,6 +47,20 @@ switch (invocation.mode) {
     runDumpConfig(invocation.profile, invocation.defaultOnly, invocation.patches)
     break
   }
+  case 'watch': {
+    const { superviseCommand } = await import('./watch.ts')
+    const script = process.argv[1]
+    /* v8 ignore next -- a CLI always has a script path; this guards the type. */
+    if (script === undefined) throw new Error('dsh watch: cannot determine the dsh script path to supervise')
+    const controller = new AbortController()
+    const stop = (): void => { controller.abort() }
+    process.on('SIGINT', stop)
+    process.on('SIGTERM', stop)
+    await superviseCommand(process.execPath, [...process.execArgv, script, ...invocation.args], {
+      signal: controller.signal,
+    })
+    break
+  }
   default:
     invocation satisfies never
     throw new Error(`dsh: unhandled invocation mode ${JSON.stringify(invocation)}`)
