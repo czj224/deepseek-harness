@@ -28,7 +28,7 @@ import {
   type JsonlCompression,
 } from './format.ts'
 import {
-  compressZstdFrame, createZstdFrameDecoder, decompressZstdFrame, decompressZstdPrefix, scanZstdFrames,
+  compressZstdFrame, decodeZstdFrames, decompressZstdFrame, decompressZstdPrefix, forEachZstdFrame, scanZstdFrames,
 } from './zstd.ts'
 import { ensureDurableDirectoryWin32, publishNewFileWin32 } from './win32.ts'
 
@@ -38,8 +38,8 @@ const DEFAULT_PACK_CHUNKS = true
 const DEFAULT_COMPRESSION: JsonlCompression = 'zstd'
 /**
  * Internal scheduling constant, not deployment configuration: balance
- * frame-boundary event-loop yields against `setImmediate` overhead. One frame
- * remains an indivisible synchronous decode.
+ * frame-boundary event-loop yields against `setImmediate` overhead. Decoding is
+ * async, but one frame's JSONL scan remains an indivisible synchronous unit.
  */
 const ZSTD_DECODE_YIELD_INTERVAL_MS = 500
 
@@ -260,14 +260,7 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
     if (this.compression === 'zstd') {
       const { frames } = scanZstdFrames(buffer)
       if (frames.length === 0) throw new Error('empty or header-less Zstandard session log')
-      const decoder = createZstdFrameDecoder()
-      const plaintexts: Buffer[] = []
-      // The decoder yields views into a reused buffer; copy each frame's
-      // plaintext immediately so a later concat cannot read overwritten memory.
-      for (const plaintext of decoder.decode(buffer, frames)) {
-        signal?.throwIfAborted()
-        plaintexts.push(Buffer.from(plaintext))
-      }
+      const plaintexts = await decodeZstdFrames(buffer, frames, signal)
       content = Buffer.concat(plaintexts).toString('utf8')
     } else {
       content = buffer.toString('utf8')
@@ -354,67 +347,59 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
     signal?.throwIfAborted()
     if (frames.length === 0) throw new Error('empty or header-less Zstandard session log')
 
-    const decoder = createZstdFrameDecoder()
+    // Decode the header frame separately so the scanner exists before any
+    // event frame is decoded.
+    const headerFrames = await decodeZstdFrames(buffer, frames.slice(0, 1), signal)
+    signal?.throwIfAborted()
+    const headerFrame = headerFrames[0] as Buffer
+    assertZstdHeaderFrame(headerFrame)
+    const scanner = new SessionLogScanner(headerFrame)
+
+    // Stream event frames into the scanner one batch at a time, yielding at
+    // frame boundaries so a large log neither holds every frame's plaintext in
+    // memory nor monopolizes the event loop.
     let yieldDeadline = performance.now() + ZSTD_DECODE_YIELD_INTERVAL_MS
+    let remainingFrames = frames.length - 1
+    await forEachZstdFrame(buffer, frames.slice(1), async (plaintext) => {
+      scanner.write(plaintext)
+      remainingFrames -= 1
+      if (remainingFrames > 0 && performance.now() >= yieldDeadline) {
+        await scheduler.yield()
+        signal?.throwIfAborted()
+        yieldDeadline = performance.now() + ZSTD_DECODE_YIELD_INTERVAL_MS
+      }
+    }, signal)
+    signal?.throwIfAborted()
+    const complete = scanner.checkpoint()
+    if (complete.committedBytes !== complete.inputBytes) {
+      throw new Error('corrupt Zstandard session log: complete frame contains a torn JSONL record')
+    }
+    if (tornStart === undefined) {
+      const prefix = scanner.finish()
+      return { meta: prefix.meta, events: prefix.events }
+    }
+
+    let recoveredPlaintext: Buffer = Buffer.alloc(0)
     try {
-      const decodedFrames = decoder.decode(buffer, frames)
       signal?.throwIfAborted()
-      const headerFrame = decodedFrames.next()
-      signal?.throwIfAborted()
-      /* v8 ignore next -- a non-empty structural frame list makes the decoder yield its first frame or throw. */
-      if (headerFrame.done) throw new Error('empty or header-less Zstandard session log')
-      assertZstdHeaderFrame(headerFrame.value)
-      const scanner = new SessionLogScanner(headerFrame.value)
-
-      let remainingFrames = frames.length - 1
-      for (const plaintext of decodedFrames) {
-        signal?.throwIfAborted()
-        scanner.write(plaintext)
-        remainingFrames -= 1
-        if (remainingFrames > 0 && performance.now() >= yieldDeadline) {
-          await scheduler.yield()
-          signal?.throwIfAborted()
-          yieldDeadline = performance.now() + ZSTD_DECODE_YIELD_INTERVAL_MS
-        }
-      }
-      signal?.throwIfAborted()
-      const complete = scanner.checkpoint()
-      if (complete.committedBytes !== complete.inputBytes) {
-        throw new Error('corrupt Zstandard session log: complete frame contains a torn JSONL record')
-      }
-      if (tornStart === undefined) {
-        const prefix = scanner.finish()
-        return { meta: prefix.meta, events: prefix.events }
-      }
-
-      let recoveredPlaintext: Buffer = Buffer.alloc(0)
-      try {
-        signal?.throwIfAborted()
-        recoveredPlaintext = await decompressZstdPrefix(buffer.subarray(tornStart))
-      } catch {
-        /* v8 ignore next -- decoder failure plus concurrent abort is timing-dependent */
-        if (signal?.aborted) signal.throwIfAborted()
-        // A structurally incomplete final frame may end before Node's decoder can
-        // emit any plaintext; the complete prior frames remain recoverable.
-      }
-      signal?.throwIfAborted()
-      scanner.write(recoveredPlaintext)
-      const recoveredPrefix = scanner.finish()
-      signal?.throwIfAborted()
-      return {
-        meta: recoveredPrefix.meta,
-        events: recoveredPrefix.events,
-        tornMarker: {
-          truncateTo: tornStart,
-          recoveredEvents: recoveredPrefix.events.slice(complete.eventCount),
-        },
-      }
-    } catch (error) {
+      recoveredPlaintext = await decompressZstdPrefix(buffer.subarray(tornStart))
+    } catch {
       /* v8 ignore next -- decoder failure plus concurrent abort is timing-dependent */
       if (signal?.aborted) signal.throwIfAborted()
-      throw error
-    } finally {
-      decoder.close()
+      // A structurally incomplete final frame may end before Node's decoder can
+      // emit any plaintext; the complete prior frames remain recoverable.
+    }
+    signal?.throwIfAborted()
+    scanner.write(recoveredPlaintext)
+    const recoveredPrefix = scanner.finish()
+    signal?.throwIfAborted()
+    return {
+      meta: recoveredPrefix.meta,
+      events: recoveredPrefix.events,
+      tornMarker: {
+        truncateTo: tornStart,
+        recoveredEvents: recoveredPrefix.events.slice(complete.eventCount),
+      },
     }
   }
 

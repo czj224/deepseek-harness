@@ -9,8 +9,6 @@ import {
   constants, zstdCompress, zstdDecompress, type ZstdOptions,
 } from 'node:zlib'
 import { promisify } from 'node:util'
-import { NodePrivateZstdFrameDecoder } from './zstd-private-decoder.ts'
-import { PublicZstdFrameDecoder } from './zstd-public-decoder.ts'
 
 const ZSTD_MAGIC = 0xFD2FB528
 const zstdCompressAsync = promisify(zstdCompress)
@@ -121,27 +119,74 @@ export async function decompressZstdFrame(input: Buffer): Promise<Buffer> {
   return zstdDecompressAsync(input)
 }
 
-/** Common lifecycle for interchangeable synchronous multi-frame decoders. */
-export interface ZstdFrameDecoder {
-  /**
-   * Decode and checksum complete frames in source order. Each yielded buffer
-   * remains valid only until the iterator advances to the next frame.
-   * @param source - concatenated Zstandard frame bytes.
-   * @param frames - structurally complete ranges within `source`.
-   * @returns one plaintext buffer per frame.
-   */
-  decode(source: Buffer, frames: readonly ZstdFrameRange[]): Generator<Buffer, void, void>
-  /** Release decoder-owned resources; repeated calls are harmless. */
-  close(): void
+/** Frames decoded per parallel batch; bounds concurrent threadpool work for one log. */
+const ZSTD_DECODE_BATCH = 512
+
+/**
+ * Decode every structurally complete frame in source order and pass each
+ * frame's fresh plaintext to `sink` before the next batch is decoded.
+ *
+ * Decoding runs through the async `node:zlib` one-shot API because the
+ * previous synchronous path intermittently failed checksum validation on large
+ * logs — valid frames reported `ZSTD_error_checksum_wrong` at random positions
+ * once enough frames were decoded in one process — while the threadpool-backed
+ * async API decodes the identical bytes reliably and validates the same stored
+ * checksum. Frames decode in bounded batches, and at most one batch of
+ * plaintext is retained while `sink` runs, so a large log never holds every
+ * frame's plaintext in memory at once.
+ * @param buffer - concatenated Zstandard frame bytes.
+ * @param frames - structurally complete ranges within `buffer`.
+ * @param sink - consumes each frame's plaintext in source order; may await.
+ * @param signal - optional cancellation observed between batches and frames.
+ */
+export async function forEachZstdFrame(
+  buffer: Buffer,
+  frames: readonly ZstdFrameRange[],
+  sink: (plaintext: Buffer) => void | Promise<void>,
+  signal?: AbortSignal,
+): Promise<void> {
+  for (let start = 0; start < frames.length; start += ZSTD_DECODE_BATCH) {
+    signal?.throwIfAborted()
+    const batch = frames.slice(start, start + ZSTD_DECODE_BATCH)
+    const decoded = await Promise.all(batch.map(async (frame) => {
+      try {
+        return await decompressZstdFrame(buffer.subarray(frame.start, frame.end))
+      } catch (error) {
+        throw new Error(`corrupt Zstandard session log: frame at byte ${frame.start} failed validation`, {
+          cause: error,
+        })
+      }
+    }))
+    signal?.throwIfAborted()
+    for (const plaintext of decoded) {
+      await sink(plaintext)
+      signal?.throwIfAborted()
+    }
+  }
 }
 
 /**
- * Select the shared private decoder when the running Node 22/24/26 shape is
- * compatible, otherwise preserve correctness with the public one-shot API.
- * @returns a synchronous decoder with an implementation-independent lifecycle.
+ * Decode every structurally complete frame in source order, returning one
+ * fresh plaintext buffer per frame. Callers that only need to stream frames
+ * into a scanner should use {@link forEachZstdFrame} so an entire log's
+ * plaintext is never accumulated in memory.
+ * @param buffer - concatenated Zstandard frame bytes.
+ * @param frames - structurally complete ranges within `buffer`.
+ * @param signal - optional cancellation between batches.
+ * @returns plaintext for each frame, in source order.
  */
-export function createZstdFrameDecoder(): ZstdFrameDecoder {
-  return NodePrivateZstdFrameDecoder.create() ?? new PublicZstdFrameDecoder()
+export async function decodeZstdFrames(
+  buffer: Buffer,
+  frames: readonly ZstdFrameRange[],
+  signal?: AbortSignal,
+): Promise<Buffer[]> {
+  const plaintexts: Buffer[] = new Array<Buffer>(frames.length)
+  let index = 0
+  await forEachZstdFrame(buffer, frames, (plaintext) => {
+    plaintexts[index] = plaintext
+    index += 1
+  }, signal)
+  return plaintexts
 }
 
 /**
