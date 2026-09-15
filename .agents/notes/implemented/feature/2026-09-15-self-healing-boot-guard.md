@@ -28,6 +28,6 @@ The guard is opt-in: `boot()` gains an optional `health` option, and omitting it
 
 ## Consequences
 
-A crash loop now degrades: after two failed boots, the next boot disables the implicated entries and comes up runnable, clearing the ledger on success. Import failures are not surgically disabled because their entry is rolled back before `failedEntryIds` runs; the failure message still surfaces the module name for the agent. Boot-time failures are covered; a mid-run hang still needs an external heartbeat supervisor, which is outside this guard.
+A crash loop now degrades: after two failed boots, the next boot disables the implicated entries and comes up runnable, clearing the ledger on success. Import failures are not surgically disabled because their entry is rolled back before `failedEntryIds` runs; the failure message still surfaces the module name for the agent. Boot-time failures are covered here; crash-restart and mid-run hang detection are the `dsh watch` supervisor's job — it relaunches a crashed or heartbeat-stale child while this guard breaks the crash loop.
 
 Unit and integration tests pin ledger round-trips, threshold behavior, recovery-patch injection, a real crash-loop recovery, opt-in zero-side-effect, and prompt-section surfacing. The guard is keyless and covers both Windows and POSIX through the shared boot path.

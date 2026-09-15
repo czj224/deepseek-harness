@@ -61,6 +61,7 @@ export {
   recordBootSuccess,
   type BootHealthLedger,
 } from './boot-health.ts'
+export { startHeartbeat } from './heartbeat.ts'
 
 /**
  * Resolve the config to boot. Replay swaps a `cordis.yml` basename for
